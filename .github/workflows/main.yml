@@ -8,27 +8,42 @@ on:
     types: [opened]
   pull_request_target:
     types: [opened]
+  issue_comment:
+    types: [created]
 
 jobs:
-  comment:
+  triage:
     runs-on: ubuntu-latest
     steps:
-      - name: Comment on Issue or PR
+      - name: Triage Issue, PR, or Comment
         uses: actions/github-script@v7
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
-            const isIssue = !!context.payload.issue;
-            const number = isIssue
-              ? context.payload.issue.number
-              : context.payload.pull_request.number;
-            const type = isIssue ? "issue" : "pull request";
-            const body = isIssue
-              ? context.payload.issue.body || ""
-              : context.payload.pull_request.body || "";
-            const author = isIssue
-              ? context.payload.issue.user.login
-              : context.payload.pull_request.user.login;
+            // --- Determine event type and extract payload ---
+            const eventName = context.eventName;
+            const isComment = eventName === "issue_comment";
+            const isIssue = !isComment && !!context.payload.issue && !context.payload.pull_request;
+            const isPR = !isComment && !!context.payload.pull_request;
+
+            let number, body, author, type;
+
+            if (isComment) {
+              number = context.payload.issue.number;
+              body = (context.payload.comment.body || "").substring(0, 65536);
+              author = context.payload.comment.user.login;
+              type = "comment";
+            } else if (isIssue) {
+              number = context.payload.issue.number;
+              body = (context.payload.issue.body || "").substring(0, 65536);
+              author = context.payload.issue.user.login;
+              type = "issue";
+            } else {
+              number = context.payload.pull_request.number;
+              body = (context.payload.pull_request.body || "").substring(0, 65536);
+              author = context.payload.pull_request.user.login;
+              type = "pull request";
+            }
 
             // --- Sensitive info detection with category labels ---
             const sensitiveChecks = [
@@ -64,6 +79,9 @@ jobs:
 
             const possibleScam = scamPatterns.some((p) => p.test(body));
 
+            // --- Skip triage comment for non-issue events (PRs/PR comments don't need triage msg) ---
+            const shouldPostTriage = isIssue || isComment;
+
             // --- Build sensitive warning section ---
             let sensitiveWarning = "";
             if (hasSensitiveInfo) {
@@ -95,30 +113,46 @@ jobs:
               ].join("\n");
             }
 
-            const commentBody = [
-              `Thanks for opening this ${type}. A maintainer will review it shortly.`,
-              "",
-              sensitiveWarning,
-              scamWarning,
-              "**📋 Next steps:**",
-              "- A maintainer will review and apply relevant labels.",
-              "- If this is a bug report, please include steps to reproduce and expected vs. actual behavior.",
-              "- For feature requests, describe the use case and expected outcome.",
-              "",
-              "**⚠️ Important:** Do not share private keys, seed phrases, wallet credentials, or personal contact info in public issues. Use [private vulnerability reporting](https://docs.github.com/en/code-security/security-advisories/guidance-on-reporting-and-writing-information-about-vulnerabilities/managing-privately-reported-security-vulnerabilities) for security concerns.",
-              "",
-              "_This is an automated triage message. A human maintainer will respond._",
-            ].filter(Boolean).join("\n");
+            // --- Only post a comment if there's something to warn about, or it's a new issue ---
+            const hasWarnings = hasSensitiveInfo || possibleScam;
 
-            await github.rest.issues.createComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: number,
-              body: commentBody,
-            });
+            if (!isComment || hasWarnings) {
+              const commentBody = [
+                hasWarnings
+                  ? `**⚠️ Automated triage for this ${type} by @${author}:**`
+                  : `Thanks for opening this ${type}. A maintainer will review it shortly.`,
+                "",
+                sensitiveWarning,
+                scamWarning,
+                hasWarnings
+                  ? [
+                      "**📋 Required action:**",
+                      "- Edit the " + type + " and remove all flagged content immediately.",
+                      "- Do NOT follow any external links claiming to be support pages.",
+                      "",
+                    ].join("\n")
+                  : [
+                      "**📋 Next steps:**",
+                      "- A maintainer will review and apply relevant labels.",
+                      "- If this is a bug report, please include steps to reproduce and expected vs. actual behavior.",
+                      "- For feature requests, describe the use case and expected outcome.",
+                      "",
+                    ].join("\n"),
+                "**⚠️ Important:** Do not share private keys, seed phrases, wallet credentials, or personal contact info in public issues. Use [private vulnerability reporting](https://docs.github.com/en/code-security/security-advisories/guidance-on-reporting-and-writing-information-about-vulnerabilities/managing-privately-reported-security-vulnerabilities) for security concerns.",
+                "",
+                "_This is an automated triage message. A human maintainer will respond._",
+              ].filter(Boolean).join("\n");
 
-            // --- Apply labels for issues with sensitive info ---
-            if (isIssue && hasSensitiveInfo) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: number,
+                body: commentBody,
+              });
+            }
+
+            // --- Apply labels for issues/comments with sensitive info ---
+            if (hasSensitiveInfo) {
               const labels = ["contains-sensitive-info", "needs-triage"];
               try {
                 await github.rest.issues.addLabels({
@@ -146,7 +180,7 @@ jobs:
             }
 
             // --- Apply warning label for suspected phishing content ---
-            if (isIssue && possibleScam) {
+            if (possibleScam) {
               try {
                 await github.rest.issues.addLabels({
                   owner: context.repo.owner,
@@ -156,5 +190,20 @@ jobs:
                 });
               } catch (e) {
                 // Label may not exist; that's fine
+              }
+
+              // Also auto-lock when scam links are detected in comments
+              if (isComment) {
+                try {
+                  await github.rest.issues.update({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    issue_number: number,
+                    locked: true,
+                    lock_reason: "resolved",
+                  });
+                } catch (e) {
+                  // May lack permission; that's fine
+                }
               }
             }

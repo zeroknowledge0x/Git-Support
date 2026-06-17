@@ -4,6 +4,7 @@ GitHub Actions bot for issue/PR triage and security.
 
 ## What it does
 
+### Real-time triage (`main.yml`)
 - Auto-comments on every new issue and pull request with a triage message.
 - **Scans comments on issues** for sensitive information and phishing links — not just the issue body.
 - Detects sensitive information (wallet addresses, emails, private keys, seed phrases) and warns the author with **specific category details** (e.g., "BTC wallet address", "personal email address").
@@ -13,6 +14,14 @@ GitHub Actions bot for issue/PR triage and security.
 - **Auto-locks issues** containing sensitive information to prevent further data exposure by other commenters.
 - **Auto-locks issues** when scam links are detected in comments.
 - Directs security concerns to GitHub's private vulnerability reporting.
+
+### Retroactive scan (`retroactive-scan.yml`)
+- Runs **daily at 06:00 UTC** (and can be triggered manually via `workflow_dispatch`).
+- Re-scans all open issues for sensitive information and scam links that may have been missed before the real-time bot was active.
+- Scans both issue bodies **and all comments** on each issue.
+- Skips issues that are already flagged (have `contains-sensitive-info` or `possible-scam` labels).
+- Posts a warning comment, applies labels, and auto-locks newly flagged issues.
+- Built with rate-limiting (500ms delay between issues) to avoid API throttling.
 
 ## Security
 
@@ -41,3 +50,7 @@ The bot detects known phishing patterns in both issue bodies and comments, inclu
 - "Live chat page" or "contact agent" lures
 
 When detected, the issue is labeled `possible-scam` and locked.
+
+## Manual trigger
+
+To trigger the retroactive scan manually, go to **Actions > Retroactive Security Scan > Run workflow**.

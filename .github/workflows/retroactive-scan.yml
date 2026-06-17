@@ -1,0 +1,217 @@
+name: Retroactive Security Scan for Open Issues
+permissions:
+  issues: write
+  pull-requests: write
+
+on:
+  schedule:
+    - cron: "0 6 * * *"  # Daily at 06:00 UTC
+  workflow_dispatch: {}   # Allow manual trigger
+
+jobs:
+  retroactive-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Scan open issues for sensitive info and scam links
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            // --- Shared detection patterns (mirror of main.yml triage) ---
+            const sensitiveChecks = [
+              { pattern: /\b[13][a-km-zA-HJ-NP-Z1-9]{25,34}\b/g, label: "BTC wallet address" },
+              { pattern: /\b0x[a-fA-F0-9]{40}\b/g,                label: "ETH wallet address" },
+              { pattern: /\bT[a-zA-Z0-9]{33}\b/g,                 label: "TRON/TRC20 wallet address" },
+              { pattern: /private[\s._-]?key/i,                    label: "possible private key reference" },
+              { pattern: /seed[\s._-]?phrase/i,                    label: "possible seed phrase reference" },
+              { pattern: /mnemonic/i,                               label: "possible mnemonic reference" },
+              { pattern: /\b[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}\b/g, label: "personal email address" },
+            ];
+
+            const scamPatterns = [
+              /\bofficial\w+page\b/i,
+              /\bweb\.app\b/i,
+              /\bgitactivebox\b/i,
+              /\blive.?chat.?page\b/i,
+              /\bcontact.*agent\b/i,
+              /\bhub.?agent\b/i,
+            ];
+
+            const LABEL_SENSITIVE = "contains-sensitive-info";
+            const LABEL_SCAM = "possible-scam";
+            const LABEL_NEEDS_TRIAGE = "needs-triage";
+
+            function detectSensitive(text) {
+              const found = [];
+              for (const check of sensitiveChecks) {
+                if (check.pattern.test(text)) {
+                  found.push(check.label);
+                }
+                check.pattern.lastIndex = 0;
+              }
+              return found;
+            }
+
+            function detectScam(text) {
+              return scamPatterns.some((p) => p.test(text));
+            }
+
+            // Fetch all open issues (paginate)
+            const issues = await github.paginate(
+              github.rest.issues.listForRepo,
+              {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                state: "open",
+                per_page: 100,
+                sort: "created",
+                direction: "desc",
+              }
+            );
+
+            let scanned = 0;
+            let flagged = 0;
+
+            for (const issue of issues) {
+              // Skip pull requests
+              if (issue.pull_request) continue;
+
+              const issueNumber = issue.number;
+              scanned++;
+
+              // Check if already flagged (has both labels)
+              const existingLabels = issue.labels.map(l => l.name);
+              const alreadySensitive = existingLabels.includes(LABEL_SENSITIVE);
+              const alreadyScam = existingLabels.includes(LABEL_SCAM);
+
+              // Scan issue body
+              const body = (issue.body || "").substring(0, 65536);
+              const bodySensitive = detectSensitive(body);
+              const bodyScam = detectScam(body);
+
+              // Fetch and scan comments
+              const comments = await github.paginate(
+                github.rest.issues.listComments,
+                {
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: issueNumber,
+                  per_page: 100,
+                }
+              );
+
+              let commentSensitiveCategories = [];
+              let commentHasScam = false;
+
+              for (const comment of comments) {
+                const commentBody = (comment.body || "").substring(0, 65536);
+                const cs = detectSensitive(commentBody);
+                commentSensitiveCategories.push(...cs);
+                if (detectScam(commentBody)) commentHasScam = true;
+              }
+
+              // Merge all detections
+              const allSensitive = [...new Set([...bodySensitive, ...commentSensitiveCategories])];
+              const hasSensitive = allSensitive.length > 0;
+              const hasScam = bodyScam || commentHasScam;
+
+              // Skip if already fully flagged
+              if (hasSensitive && alreadySensitive && hasScam && alreadyScam) continue;
+              if (hasSensitive && alreadySensitive && !hasScam) continue;
+              if (hasScam && alreadyScam && !hasSensitive) continue;
+              if (!hasSensitive && !hasScam) continue;
+
+              flagged++;
+
+              // Build warning comment
+              const sections = [];
+
+              if (hasSensitive && !alreadySensitive) {
+                const categories = allSensitive.map(d => `  - ${d}`).join("\n");
+                sections.push([
+                  `**🛡️ Retroactive Scan — Sensitive Information Detected:**`,
+                  categories,
+                  "",
+                  `**Please edit issue #${issueNumber} and all comments immediately** and remove all wallet addresses,`,
+                  "private keys, seed phrases, and personal contact details. Exposing these",
+                  "publicly puts you at risk of phishing, wallet theft, and identity fraud.",
+                  "",
+                  "⚠️ **Important:** Do not share private keys, seed phrases, wallet credentials, or personal contact info in public issues.",
+                  "Use [private vulnerability reporting](https://docs.github.com/en/code-security/security-advisories/guidance-on-reporting-and-writing-information-about-vulnerabilities/managing-privately-reported-security-vulnerabilities) for security concerns.",
+                  "",
+                ].join("\n"));
+              }
+
+              if (hasScam && !alreadyScam) {
+                sections.push([
+                  "**⚠️ Retroactive Scan — Phishing / Scam Links Detected:**",
+                  "This issue or its comments contain links or references to",
+                  "unofficial support channels. Never follow external links claiming to be",
+                  "official support pages. All legitimate communication happens on this",
+                  "GitHub repository only.",
+                  "",
+                  "**📋 Required action:** Remove all flagged external links and do NOT follow them.",
+                  "",
+                ].join("\n"));
+              }
+
+              sections.push("_This is an automated retroactive security scan by the triage bot._");
+
+              const commentBody = sections.join("\n");
+
+              // Post warning comment
+              try {
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: issueNumber,
+                  body: commentBody,
+                });
+              } catch (e) {
+                core.warning(`Failed to comment on #${issueNumber}: ${e.message}`);
+              }
+
+              // Apply labels
+              const newLabels = [];
+              if (hasSensitive && !alreadySensitive) {
+                newLabels.push(LABEL_SENSITIVE, LABEL_NEEDS_TRIAGE);
+              }
+              if (hasScam && !alreadyScam) {
+                newLabels.push(LABEL_SCAM, LABEL_NEEDS_TRIAGE);
+              }
+
+              if (newLabels.length > 0) {
+                try {
+                  // Merge with existing labels to avoid removing them
+                  const allLabels = [...new Set([...existingLabels, ...newLabels])];
+                  await github.rest.issues.update({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    issue_number: issueNumber,
+                    labels: allLabels,
+                  });
+                } catch (e) {
+                  core.warning(`Failed to label #${issueNumber}: ${e.message}`);
+                }
+              }
+
+              // Auto-lock issues with sensitive info
+              if (hasSensitive && !alreadySensitive) {
+                try {
+                  await github.rest.issues.update({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    issue_number: issueNumber,
+                    locked: true,
+                    lock_reason: "resolved",
+                  });
+                } catch (e) {
+                  core.warning(`Failed to lock #${issueNumber}: ${e.message}`);
+                }
+              }
+
+              // Rate-limit: small delay between issues
+              await new Promise(r => setTimeout(r, 500));
+            }
+
+            core.info(`Retroactive scan complete: ${scanned} open issues scanned, ${flagged} newly flagged.`);

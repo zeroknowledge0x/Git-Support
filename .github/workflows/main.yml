@@ -1,4 +1,4 @@
-name: Comment on Every New Issue and PR
+name: Triage and Comment on New Issues and PRs
 
 permissions:
   issues: write
@@ -20,14 +20,68 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
             const isIssue = !!context.payload.issue;
-            const number = isIssue ? context.payload.issue.number : context.payload.pull_request.number;
+            const number = isIssue
+              ? context.payload.issue.number
+              : context.payload.pull_request.number;
             const type = isIssue ? "issue" : "pull request";
-            const message = isIssue
-              ? "For quick review and assistance, contact the hub agent on the live chat page to report your issue via [Web Support page](https://officialgittechpage.web.app). Alternatively send an E-mail to report this via Gitactivebox@gmail.com to ensure total review with the technical support."
-              : "🎉 Thanks for opening a pull request! We're excited to review your contribution.";
+            const body = isIssue
+              ? context.payload.issue.body || ""
+              : context.payload.pull_request.body || "";
+
+            // Detect sensitive info patterns (wallet addresses, private keys, emails, seed phrases)
+            const sensitivePatterns = [
+              /\b[13][a-km-zA-HJ-NP-Z1-9]{25,34}\b/, // BTC
+              /\b0x[a-fA-F0-9]{40}\b/,                 // ETH
+              /\bT[a-zA-Z0-9]{33}\b/,                   // TRON/TRC20
+              /private.?key/i,
+              /seed.?phrase/i,
+              /mnemonic/i,
+              /\b[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}\b/, // email
+            ];
+
+            const hasSensitiveInfo = sensitivePatterns.some((p) => p.test(body));
+
+            let sensitiveWarning = "";
+            if (hasSensitiveInfo) {
+              sensitiveWarning = [
+                "",
+                "---",
+                "**🛡️ Security Warning:** This ${type} may contain sensitive information such as wallet addresses, private keys, or personal emails. Please remove any private details — never share private keys, seed phrases, or wallet credentials publicly.",
+                "",
+              ].join("\n");
+            }
+
+            const commentBody = [
+              `Thanks for opening this ${type}. A maintainer will review it shortly.`,
+              "",
+              sensitiveWarning,
+              "**📋 Next steps:**",
+              "- A maintainer will review and apply relevant labels.",
+              "- If this is a bug report, please include steps to reproduce and expected vs. actual behavior.",
+              "- For feature requests, describe the use case and expected outcome.",
+              "",
+              "**⚠️ Important:** Do not share private keys, seed phrases, wallet credentials, or personal contact info in public issues. Use [private vulnerability reporting](https://docs.github.com/en/code-security/security-advisories/guidance-on-reporting-and-writing-information-about-vulnerabilities/managing-privately-reported-security-vulnerabilities) for security concerns.",
+              "",
+              "_This is an automated triage message. A human maintainer will respond._",
+            ].filter(Boolean).join("\n");
+
             await github.rest.issues.createComment({
               owner: context.repo.owner,
               repo: context.repo.repo,
               issue_number: number,
-              body: message + "\n\nTeam🚀"
+              body: commentBody,
             });
+
+            // Apply labels for issues with sensitive info
+            if (isIssue && hasSensitiveInfo) {
+              try {
+                await github.rest.issues.addLabels({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: number,
+                  labels: ["contains-sensitive-info", "needs-triage"],
+                });
+              } catch (e) {
+                // Label may not exist; that's fine
+              }
+            }

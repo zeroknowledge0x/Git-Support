@@ -1,5 +1,4 @@
 name: Triage and Comment on New Issues and PRs
-
 permissions:
   issues: write
   pull-requests: write
@@ -27,26 +26,71 @@ jobs:
             const body = isIssue
               ? context.payload.issue.body || ""
               : context.payload.pull_request.body || "";
+            const author = isIssue
+              ? context.payload.issue.user.login
+              : context.payload.pull_request.user.login;
 
-            // Detect sensitive info patterns (wallet addresses, private keys, emails, seed phrases)
-            const sensitivePatterns = [
-              /\b[13][a-km-zA-HJ-NP-Z1-9]{25,34}\b/, // BTC
-              /\b0x[a-fA-F0-9]{40}\b/,                 // ETH
-              /\bT[a-zA-Z0-9]{33}\b/,                   // TRON/TRC20
-              /private.?key/i,
-              /seed.?phrase/i,
-              /mnemonic/i,
-              /\b[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}\b/, // email
+            // --- Sensitive info detection with category labels ---
+            const sensitiveChecks = [
+              { pattern: /\b[13][a-km-zA-HJ-NP-Z1-9]{25,34}\b/g, label: "BTC wallet address" },
+              { pattern: /\b0x[a-fA-F0-9]{40}\b/g,                label: "ETH wallet address" },
+              { pattern: /\bT[a-zA-Z0-9]{33}\b/g,                 label: "TRON/TRC20 wallet address" },
+              { pattern: /private[\s._-]?key/i,                    label: "possible private key reference" },
+              { pattern: /seed[\s._-]?phrase/i,                    label: "possible seed phrase reference" },
+              { pattern: /mnemonic/i,                               label: "possible mnemonic reference" },
+              { pattern: /\b[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}\b/g, label: "personal email address" },
             ];
 
-            const hasSensitiveInfo = sensitivePatterns.some((p) => p.test(body));
+            const detected = [];
+            for (const check of sensitiveChecks) {
+              if (check.pattern.test(body)) {
+                detected.push(check.label);
+              }
+              // Reset regex lastIndex for global patterns
+              check.pattern.lastIndex = 0;
+            }
 
+            const hasSensitiveInfo = detected.length > 0;
+
+            // --- Phishing / scam link detection ---
+            const scamPatterns = [
+              /\bofficial\w+page\b/i,
+              /\bweb\.app\b/i,
+              /\bgitactivebox\b/i,
+              /\blive.?chat.?page\b/i,
+              /\bcontact.*agent\b/i,
+              /\bhub.?agent\b/i,
+            ];
+
+            const possibleScam = scamPatterns.some((p) => p.test(body));
+
+            // --- Build sensitive warning section ---
             let sensitiveWarning = "";
             if (hasSensitiveInfo) {
+              const categories = detected.map((d) => `  - ${d}`).join("\n");
               sensitiveWarning = [
                 "",
                 "---",
-                "**🛡️ Security Warning:** This ${type} may contain sensitive information such as wallet addresses, private keys, or personal emails. Please remove any private details — never share private keys, seed phrases, or wallet credentials publicly.",
+                `**🛡️ Security Warning:** This ${type} appears to contain sensitive information:`,
+                categories,
+                "",
+                "**Please edit this " + type + " immediately** and remove all wallet addresses,",
+                "private keys, seed phrases, and personal contact details. Exposing these",
+                "publicly puts you at risk of phishing, wallet theft, and identity fraud.",
+                "",
+              ].join("\n");
+            }
+
+            // --- Build scam warning section ---
+            let scamWarning = "";
+            if (possibleScam) {
+              scamWarning = [
+                "",
+                "---",
+                "**⚠️ Phishing Alert:** This " + type + " may contain links or references to",
+                "unofficial support channels. Never follow external links claiming to be",
+                "official support pages. All legitimate communication happens on this",
+                "GitHub repository only.",
                 "",
               ].join("\n");
             }
@@ -55,6 +99,7 @@ jobs:
               `Thanks for opening this ${type}. A maintainer will review it shortly.`,
               "",
               sensitiveWarning,
+              scamWarning,
               "**📋 Next steps:**",
               "- A maintainer will review and apply relevant labels.",
               "- If this is a bug report, please include steps to reproduce and expected vs. actual behavior.",
@@ -72,14 +117,42 @@ jobs:
               body: commentBody,
             });
 
-            // Apply labels for issues with sensitive info
+            // --- Apply labels for issues with sensitive info ---
             if (isIssue && hasSensitiveInfo) {
+              const labels = ["contains-sensitive-info", "needs-triage"];
               try {
                 await github.rest.issues.addLabels({
                   owner: context.repo.owner,
                   repo: context.repo.repo,
                   issue_number: number,
-                  labels: ["contains-sensitive-info", "needs-triage"],
+                  labels: labels,
+                });
+              } catch (e) {
+                // Label may not exist; that's fine
+              }
+
+              // Auto-lock to prevent further sensitive data exposure
+              try {
+                await github.rest.issues.update({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: number,
+                  locked: true,
+                  lock_reason: "resolved",
+                });
+              } catch (e) {
+                // May lack permission; that's fine
+              }
+            }
+
+            // --- Apply warning label for suspected phishing content ---
+            if (isIssue && possibleScam) {
+              try {
+                await github.rest.issues.addLabels({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: number,
+                  labels: ["possible-scam", "needs-triage"],
                 });
               } catch (e) {
                 // Label may not exist; that's fine
